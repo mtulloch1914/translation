@@ -1,20 +1,13 @@
 import express from 'express';
-import { WebSocketServer } from 'ws';
-import WebSocket from 'ws';
-import fetch from 'node-fetch';
-import pkg from '@signalwire/node';
 import bodyParser from 'body-parser';
 import { createServer } from 'http';
-import { URL } from 'url';
-
-const { VoiceResponse } = pkg;
+import { WebSocketServer } from 'ws';
 
 // Load environment variables
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SIGNALWIRE_PROJECT_ID = process.env.SIGNALWIRE_PROJECT_ID;
 const SIGNALWIRE_API_TOKEN = process.env.SIGNALWIRE_API_TOKEN;
-const SIGNALWIRE_SPACE_URL = process.env.SIGNALWIRE_SPACE_URL;
 
 // Validate required environment variables
 if (!OPENAI_API_KEY || !SIGNALWIRE_PROJECT_ID || !SIGNALWIRE_API_TOKEN) {
@@ -30,34 +23,28 @@ const wss = new WebSocketServer({ server });
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Store active OpenAI connections
-const openAIConnections = new Map();
-
 // Logging function
 function log(message, data = '') {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] ${message}`, data ? JSON.stringify(data, null, 2) : '');
 }
 
-// POST /voice endpoint - Returns SignalWire XML to connect to WebSocket
+// POST /voice endpoint - Returns simple XML
 app.post('/voice', (req, res) => {
   log('Received SignalWire voice request');
   
-  const response = new VoiceResponse();
+  // Simple XML response without VoiceResponse
+  const xmlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="wss://${req.headers.host}/signalwire-media"/>
+  </Connect>
+</Response>`;
   
-  // Create WebSocket URL for this call
-  const protocol = req.headers['x-forwarded-proto'] || 'http';
-  const host = req.headers.host;
-  const wsUrl = `${protocol === 'https' ? 'wss' : 'ws'}://${host}/signalwire-media`;
-  
-  log(`Connecting to WebSocket: ${wsUrl}`);
-  
-  // Connect to WebSocket media stream
-  const connect = response.connect();
-  connect.stream({ url: wsUrl });
+  log(`Connecting to WebSocket: wss://${req.headers.host}/signalwire-media`);
   
   res.type('text/xml');
-  res.send(response.toString());
+  res.send(xmlResponse);
 });
 
 // Health check endpoint
@@ -65,7 +52,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    activeConnections: openAIConnections.size
+    activeConnections: 0
   });
 });
 

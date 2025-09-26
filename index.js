@@ -2,21 +2,19 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
-import { twiml } from 'twilio';
 import bodyParser from 'body-parser';
 import { createServer } from 'http';
-import { URL } from 'url';
 
 // Load environment variables
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const SIGNALWIRE_PROJECT_ID = process.env.SIGNALWIRE_PROJECT_ID;
+const SIGNALWIRE_API_TOKEN = process.env.SIGNALWIRE_API_TOKEN;
+const SIGNALWIRE_SPACE_URL = process.env.SIGNALWIRE_SPACE_URL;
 
 // Validate required environment variables
-if (!OPENAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
-  console.error('Missing required environment variables:');
-  console.error('Required: OPENAI_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN');
+if (!OPENAI_API_KEY) {
+  console.error('❌ Missing OPENAI_API_KEY');
   process.exit(1);
 }
 
@@ -26,9 +24,6 @@ const wss = new WebSocketServer({ server });
 
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
-
-// Store active OpenAI connections
-const openAIConnections = new Map();
 
 // Logging function
 function log(message, data = '') {
@@ -65,41 +60,42 @@ async function createOpenAISession() {
   }
 }
 
-// POST /voice endpoint - Returns TwiML to connect to WebSocket
+// POST /voice endpoint - Returns SignalWire XML
 app.post('/voice', (req, res) => {
-  log('📞 Received voice request');
-  
-  const response = new twiml.VoiceResponse();
+  log('📞 Received SignalWire voice request');
   
   // Create WebSocket URL for this call
   const protocol = req.headers['x-forwarded-proto'] || 'http';
   const host = req.headers.host;
-  const wsUrl = `${protocol === 'https' ? 'wss' : 'ws'}://${host}/twilio-media`;
+  const wsUrl = `${protocol === 'https' ? 'wss' : 'ws'}://${host}/signalwire-media`;
   
   log(`🔗 Connecting to WebSocket: ${wsUrl}`);
   
-  // Connect to WebSocket media stream
-  const connect = response.connect();
-  connect.stream({ url: wsUrl });
+  // SignalWire XML Response
+  const xmlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}"/>
+  </Connect>
+</Response>`;
   
   res.type('text/xml');
-  res.send(response.toString());
+  res.send(xmlResponse);
 });
 
-// WebSocket endpoint for Twilio Media Stream
+// WebSocket endpoint for SignalWire Media Stream
 wss.on('connection', async (ws, req) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  
-  if (url.pathname !== '/twilio-media') {
-    log('❌ Invalid WebSocket path:', url.pathname);
+  if (req.url !== '/signalwire-media') {
+    log('❌ Invalid WebSocket path:', req.url);
     ws.close();
     return;
   }
   
-  log('🔌 Twilio WebSocket connection established');
+  log('🔌 SignalWire WebSocket connection established');
   
   let openAIWS = null;
   let sessionId = null;
+  let streamSid = null;
   let audioChunksReceived = 0;
   let audioChunksSent = 0;
   
@@ -116,13 +112,11 @@ wss.on('connection', async (ws, req) => {
       },
     });
     
-    openAIConnections.set(sessionId, { openAIWS, twilioWS: ws });
-    
     // Handle OpenAI WebSocket connection
     openAIWS.on('open', () => {
       log('🎯 OpenAI WebSocket connected');
       
-      // Send initial session.update event
+      // Configure translation session
       openAIWS.send(JSON.stringify({
         type: 'session.update',
         session: {
@@ -155,11 +149,11 @@ wss.on('connection', async (ws, req) => {
           audioChunksSent++;
           log(`🔊 Translation audio chunk #${audioChunksSent} received from OpenAI`);
           
-          // Forward audio chunks to Twilio
-          if (ws.readyState === WebSocket.OPEN) {
+          // Forward translation audio to SignalWire
+          if (ws.readyState === WebSocket.OPEN && streamSid) {
             ws.send(JSON.stringify({
               event: 'media',
-              streamSid: event.stream_sid,
+              streamSid: streamSid,
               media: {
                 payload: event.delta,
               },
@@ -180,18 +174,10 @@ wss.on('connection', async (ws, req) => {
     
     openAIWS.on('close', () => {
       log('🎯 OpenAI WebSocket closed');
-      openAIConnections.delete(sessionId);
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
     });
     
     openAIWS.on('error', (error) => {
       log('❌ OpenAI WebSocket error:', error);
-      openAIConnections.delete(sessionId);
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
     });
     
   } catch (error) {
@@ -200,18 +186,19 @@ wss.on('connection', async (ws, req) => {
     return;
   }
   
-  // Handle Twilio WebSocket messages
+  // Handle SignalWire WebSocket messages
   ws.on('message', (data) => {
     try {
       const message = JSON.parse(data.toString());
       
       if (message.event === 'start') {
-        log('🎤 Twilio stream started', { streamSid: message.start.streamSid });
+        streamSid = message.start.streamSid;
+        log('🎤 SignalWire stream started', { streamSid: streamSid });
       } else if (message.event === 'media') {
         audioChunksReceived++;
         log(`🎤 Audio chunk #${audioChunksReceived} received from caller`);
         
-        // Forward audio to OpenAI
+        // Forward audio to OpenAI for translation
         if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
           openAIWS.send(JSON.stringify({
             type: 'input_audio_buffer.append',
@@ -222,33 +209,27 @@ wss.on('connection', async (ws, req) => {
           log('❌ OpenAI WebSocket not ready for audio');
         }
       } else if (message.event === 'stop') {
-        log('🛑 Twilio stream stopped');
+        log('🛑 SignalWire stream stopped');
         if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
           openAIWS.close();
         }
       }
     } catch (error) {
-      log('❌ Error processing Twilio message:', error);
+      log('❌ Error processing SignalWire message:', error);
     }
   });
   
   ws.on('close', () => {
-    log(`🔌 Twilio WebSocket closed. Total: ${audioChunksReceived} received, ${audioChunksSent} translation chunks sent`);
+    log(`🔌 SignalWire WebSocket closed. Total: ${audioChunksReceived} received, ${audioChunksSent} translation chunks sent`);
     if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
       openAIWS.close();
-    }
-    if (sessionId) {
-      openAIConnections.delete(sessionId);
     }
   });
   
   ws.on('error', (error) => {
-    log('❌ Twilio WebSocket error:', error);
+    log('❌ SignalWire WebSocket error:', error);
     if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
       openAIWS.close();
-    }
-    if (sessionId) {
-      openAIConnections.delete(sessionId);
     }
   });
 });
@@ -258,7 +239,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
-    activeConnections: openAIConnections.size 
+    activeConnections: wss.clients.size 
   });
 });
 
@@ -267,6 +248,7 @@ server.listen(PORT, () => {
   log(`🌍 PHONE TRANSLATOR READY on port ${PORT}`);
   log('📞 Speak English → Hear Spanish');
   log('📞 Speak Spanish → Hear English');
+  log(`✅ Environment: OPENAI_API_KEY loaded`);
 });
 
 // Graceful shutdown

@@ -9,7 +9,6 @@ import dotenv from 'dotenv';
 
 // Load environment variables
 dotenv.config();
-
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SIGNALWIRE_PROJECT_KEY = process.env.SIGNALWIRE_PROJECT_KEY;
@@ -55,8 +54,7 @@ async function createOpenAISession() {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`OpenAI API error: ${response.status} ${response.statusText} - ${errorText}`);
+      throw new Error(`OpenAI API error: ${response.status} ${response.statusText}`);
     }
 
     const session = await response.json();
@@ -68,7 +66,7 @@ async function createOpenAISession() {
   }
 }
 
-// POST /voice endpoint - Returns SignalWire compatible response
+// POST /voice endpoint - Returns SignalWire XML to connect to WebSocket
 app.post('/voice', (req, res) => {
   log('Received voice request');
   
@@ -79,7 +77,7 @@ app.post('/voice', (req, res) => {
   
   log(`Connecting to WebSocket: ${wsUrl}`);
   
-  // Return SignalWire compatible XML response
+  // SignalWire-compatible XML response
   const xmlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -106,7 +104,6 @@ wss.on('connection', async (ws, req) => {
   let openAIWS = null;
   let sessionId = null;
   let openAIReady = false;
-  let streamSid = null;
   
   try {
     // Create OpenAI session
@@ -121,7 +118,7 @@ wss.on('connection', async (ws, req) => {
       },
     });
     
-    openAIConnections.set(sessionId, { openAIWS, signalwireWS: ws });
+    openAIConnections.set(sessionId, { openAIWS, signalWireWS: ws });
     
     // Handle OpenAI WebSocket connection
     openAIWS.on('open', () => {
@@ -159,23 +156,12 @@ wss.on('connection', async (ws, req) => {
         } else if (event.type === 'session.updated') {
           log('OpenAI session updated - ready for audio');
           openAIReady = true;
-          
-          // Send audio notification that translator is ready
-          if (ws.readyState === WebSocket.OPEN && streamSid) {
-            ws.send(JSON.stringify({
-              event: 'media',
-              streamSid: streamSid,
-              media: {
-                payload: Buffer.from('Translator ready').toString('base64'),
-              },
-            }));
-          }
         } else if (event.type === 'output_audio_chunk.delta') {
-          // Forward audio chunks to SignalWire only if ready
-          if (openAIReady && ws.readyState === WebSocket.OPEN) {
+          // Forward audio chunks to SignalWire
+          if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               event: 'media',
-              streamSid: streamSid,
+              streamSid: event.stream_sid,
               media: {
                 payload: event.delta,
               },
@@ -219,10 +205,9 @@ wss.on('connection', async (ws, req) => {
       
       if (message.event === 'start') {
         log('SignalWire stream started', { streamSid: message.start.streamSid });
-        streamSid = message.start.streamSid;
       } else if (message.event === 'media') {
-        // Forward audio to OpenAI only if ready
-        if (openAIReady && openAIWS && openAIWS.readyState === WebSocket.OPEN) {
+        // Forward audio to OpenAI only when ready
+        if (openAIWS && openAIWS.readyState === WebSocket.OPEN && openAIReady) {
           openAIWS.send(JSON.stringify({
             type: 'input_audio_buffer.append',
             audio: message.media.payload,

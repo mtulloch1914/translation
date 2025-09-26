@@ -324,7 +324,7 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
-  log('SIGINT received, shutting down gracefully');
+  log('SIGTERM received, shutting down gracefully');
   server.close(() => {
     log('Server closed');
     process.exit(0);

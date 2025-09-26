@@ -2,7 +2,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
-import { twiml } from 'twilio';
+import twilio from 'twilio';
 import bodyParser from 'body-parser';
 import { createServer } from 'http';
 import { URL } from 'url';
@@ -10,13 +10,13 @@ import { URL } from 'url';
 // Load environment variables
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const SIGNALWIRE_PROJECT_KEY = process.env.SIGNALWIRE_PROJECT_KEY;
+const SIGNALWIRE_TOKEN = process.env.SIGNALWIRE_TOKEN;
 
 // Validate required environment variables
-if (!OPENAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+if (!OPENAI_API_KEY || !SIGNALWIRE_PROJECT_KEY || !SIGNALWIRE_TOKEN) {
   console.error('Missing required environment variables:');
-  console.error('Required: OPENAI_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN');
+  console.error('Required: OPENAI_API_KEY, SIGNALWIRE_PROJECT_KEY, SIGNALWIRE_TOKEN');
   process.exit(1);
 }
 
@@ -65,16 +65,16 @@ async function createOpenAISession() {
   }
 }
 
-// POST /voice endpoint - Returns TwiML to connect to WebSocket
+// POST /voice endpoint - Returns SignalWire LAML to connect to WebSocket
 app.post('/voice', (req, res) => {
   log('Received voice request');
   
-  const response = new twiml.VoiceResponse();
+  const response = new twilio.twiml.VoiceResponse();
   
   // Create WebSocket URL for this call
   const protocol = req.headers['x-forwarded-proto'] || 'http';
   const host = req.headers.host;
-  const wsUrl = `${protocol === 'https' ? 'wss' : 'ws'}://${host}/twilio-media`;
+  const wsUrl = `${protocol === 'https' ? 'wss' : 'ws'}://${host}/media-stream`;
   
   log(`Connecting to WebSocket: ${wsUrl}`);
   
@@ -86,22 +86,21 @@ app.post('/voice', (req, res) => {
   res.send(response.toString());
 });
 
-// WebSocket endpoint for Twilio Media Stream
+// WebSocket endpoint for SignalWire Media Stream
 wss.on('connection', async (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   
-  if (url.pathname !== '/twilio-media') {
+  if (url.pathname !== '/media-stream') {
     log('Invalid WebSocket path:', url.pathname);
     ws.close();
     return;
   }
   
-  log('Twilio WebSocket connection established');
+  log('SignalWire WebSocket connection established');
   
   let openAIWS = null;
   let sessionId = null;
-  let openAIReady = false; // Track when OpenAI is ready
-  let streamSid = null; // Store stream SID for sending audio back
+  let openAIReady = false;
   
   try {
     // Create OpenAI session
@@ -126,7 +125,7 @@ wss.on('connection', async (ws, req) => {
       openAIWS.send(JSON.stringify({
         type: 'session.update',
         session: {
-          modalities: ['audio', 'text'], // Fixed: both modalities required
+          modalities: ['audio', 'text'],
           instructions: 'You are a live interpreter. Translate English → Spanish and Spanish → English in real time. Respond only with the translation audio.',
           voice: 'verse',
           input_audio_format: 'pcm16',
@@ -152,46 +151,39 @@ wss.on('connection', async (ws, req) => {
         if (event.type === 'session.created') {
           log('OpenAI session created', { session_id: event.session.id });
         } else if (event.type === 'session.updated') {
-          log('✅ OpenAI session updated and ready for audio');
+          log('OpenAI session updated - ready for audio');
           openAIReady = true;
           
-          // 🎵 PLAY READY NOTIFICATION FOR AGENT 🎵
-          if (streamSid && ws.readyState === WebSocket.OPEN) {
-            log('🔊 Playing ready notification for agent');
-            
-            // Send a simple beep tone to indicate ready state
-            // This is a 440Hz tone (A4) for 200ms at 50% volume
-            const beepData = generateBeepTone(440, 200, 0.5);
+          // Send audio notification to agent
+          if (ws.readyState === WebSocket.OPEN) {
+            // Generate a beep tone
+            const beepTone = generateBeepTone();
             
             ws.send(JSON.stringify({
               event: 'media',
-              streamSid: streamSid,
+              streamSid: event.session.id,
               media: {
-                payload: beepData,
+                payload: beepTone,
               },
             }));
             
-            // Also send a spoken message after the beep
+            // Send spoken notification
             setTimeout(() => {
               if (ws.readyState === WebSocket.OPEN) {
-                // Send text-to-speech request through OpenAI
-                openAIWS.send(JSON.stringify({
-                  type: 'response.create',
-                  response: {
-                    modalities: ['audio'],
-                    instructions: 'Say "Translator ready" in a clear, professional voice.',
-                  },
+                ws.send(JSON.stringify({
+                  event: 'say',
+                  streamSid: event.session.id,
+                  text: 'Translator ready',
                 }));
               }
-            }, 300);
+            }, 500);
           }
-          
         } else if (event.type === 'output_audio_chunk.delta') {
-          // Forward audio chunks to Twilio
+          // Forward audio chunks to SignalWire
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               event: 'media',
-              streamSid: event.stream_sid || streamSid,
+              streamSid: event.stream_sid,
               media: {
                 payload: event.delta,
               },
@@ -229,39 +221,38 @@ wss.on('connection', async (ws, req) => {
     return;
   }
   
-  // Handle Twilio WebSocket messages
+  // Handle SignalWire WebSocket messages
   ws.on('message', (data) => {
     try {
       const message = JSON.parse(data.toString());
-      log(`Received from Twilio: ${message.event}`);
+      log(`Received from SignalWire: ${message.event}`);
       
       if (message.event === 'start') {
-        log('Twilio stream started', { streamSid: message.start.streamSid });
-        streamSid = message.start.streamSid; // Store stream SID
+        log('SignalWire stream started', { streamSid: message.start.streamSid });
       } else if (message.event === 'media') {
-        // Only forward audio to OpenAI if it's ready
-        if (openAIWS && openAIWS.readyState === WebSocket.OPEN && openAIReady) {
+        // Only forward audio to OpenAI if ready
+        if (openAIReady && openAIWS && openAIWS.readyState === WebSocket.OPEN) {
           openAIWS.send(JSON.stringify({
             type: 'input_audio_buffer.append',
             audio: message.media.payload,
           }));
-          log(`📤 Audio chunk forwarded to OpenAI`);
         } else {
-          log(`❌ OpenAI WebSocket not ready for audio (ready: ${openAIReady}, state: ${openAIWS?.readyState})`);
+          log('OpenAI WebSocket not ready for audio - skipping chunk');
         }
       } else if (message.event === 'stop') {
-        log('Twilio stream stopped');
+        log('SignalWire stream stopped');
         if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
           openAIWS.close();
         }
       }
     } catch (error) {
-      log('Error processing Twilio message:', error);
+      log('Error processing SignalWire message:', error);
     }
   });
   
   ws.on('close', () => {
-    log('Twilio WebSocket closed');
+    log('SignalWire WebSocket closed');
+    openAIReady = false;
     if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
       openAIWS.close();
     }
@@ -271,7 +262,8 @@ wss.on('connection', async (ws, req) => {
   });
   
   ws.on('error', (error) => {
-    log('Twilio WebSocket error:', error);
+    log('SignalWire WebSocket error:', error);
+    openAIReady = false;
     if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
       openAIWS.close();
     }
@@ -282,23 +274,22 @@ wss.on('connection', async (ws, req) => {
 });
 
 // Helper function to generate a beep tone
-function generateBeepTone(frequency, durationMs, volume) {
-  const sampleRate = 8000; // 8kHz sample rate for telephony
-  const samples = Math.floor(sampleRate * durationMs / 1000);
-  const amplitude = Math.floor(32767 * volume); // 16-bit PCM max value
-  
-  let audioData = '';
+function generateBeepTone(frequency = 800, duration = 0.1, sampleRate = 8000) {
+  const samples = Math.floor(sampleRate * duration);
+  const tone = new Float32Array(samples);
   
   for (let i = 0; i < samples; i++) {
-    const time = i / sampleRate;
-    const sample = amplitude * Math.sin(2 * Math.PI * frequency * time);
-    // Convert to 16-bit PCM (little-endian)
-    audioData += String.fromCharCode(sample & 0xFF);
-    audioData += String.fromCharCode((sample >> 8) & 0xFF);
+    tone[i] = Math.sin(2 * Math.PI * frequency * i / sampleRate) * 0.3;
   }
   
-  // Convert to base64 for transmission
-  return Buffer.from(audioData, 'binary').toString('base64');
+  // Convert to 16-bit PCM
+  const pcm = new Int16Array(samples);
+  for (let i = 0; i < samples; i++) {
+    pcm[i] = Math.floor(tone[i] * 32767);
+  }
+  
+  // Convert to base64
+  return Buffer.from(pcm.buffer).toString('base64');
 }
 
 // Health check endpoint
@@ -315,8 +306,8 @@ server.listen(PORT, () => {
   log(`Server running on port ${PORT}`);
   log('Environment variables loaded:');
   log(`- OPENAI_API_KEY: ${OPENAI_API_KEY ? '✓' : '✗'}`);
-  log(`- TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID ? '✓' : '✗'}`);
-  log(`- TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN ? '✓' : '✗'}`);
+  log(`- SIGNALWIRE_PROJECT_KEY: ${SIGNALWIRE_PROJECT_KEY ? '✓' : '✗'}`);
+  log(`- SIGNALWIRE_TOKEN: ${SIGNALWIRE_TOKEN ? '✓' : '✗'}`);
 });
 
 // Graceful shutdown

@@ -2,10 +2,12 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
-import { VoiceResponse } from '@signalwire/node';
+import pkg from '@signalwire/node';
 import bodyParser from 'body-parser';
 import { createServer } from 'http';
 import { URL } from 'url';
+
+const { VoiceResponse } = pkg;
 
 // Load environment variables
 const PORT = process.env.PORT || 3000;

@@ -5,12 +5,11 @@ import { WebSocketServer } from 'ws';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
 
-// Load environment variables
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 if (!OPENAI_API_KEY) {
-  console.error('Missing OPENAI_API_KEY');
+  console.error('❌ Missing OPENAI_API_KEY');
   process.exit(1);
 }
 
@@ -23,12 +22,13 @@ app.use(bodyParser.json());
 
 function log(message, data = '') {
   const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${message}`, data ? JSON.stringify(data, null, 2) : '');
+  console.log(`🕐 [${timestamp}] ${message}`, data ? JSON.stringify(data, null, 2) : '');
 }
 
 // POST /voice endpoint
 app.post('/voice', (req, res) => {
-  log('Received SignalWire voice request');
+  log('📞 Received SignalWire voice request');
+  log('📋 Request body:', req.body);
   
   const xmlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -37,120 +37,67 @@ app.post('/voice', (req, res) => {
   </Connect>
 </Response>`;
   
+  log('📤 Sending XML response');
   res.type('text/xml');
   res.send(xmlResponse);
 });
 
-// WebSocket endpoint for real-time translation
+// WebSocket endpoint
 wss.on('connection', async (ws, req) => {
   if (req.url !== '/signalwire-media') {
+    log('❌ Wrong WebSocket path:', req.url);
     ws.close();
     return;
   }
   
-  log('SignalWire WebSocket connected - Starting translator');
-  
-  let openAIWS = null;
+  log('🔌 SignalWire WebSocket connected');
   let streamSid = null;
   
-  try {
-    // Create OpenAI Realtime session
-    const sessionResponse = await fetch('https://api.openai.com/v1/realtime/sessions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-realtime-preview-2024-12-17',
-        voice: 'verse',
-        instructions: 'You are a live interpreter. Translate English to Spanish and Spanish to English in real-time. Respond only with the translation.',
-      }),
-    });
-    
-    const session = await sessionResponse.json();
-    log('OpenAI session created');
-    
-    // Connect to OpenAI WebSocket
-    openAIWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', {
-      headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1',
-      },
-    });
-    
-    openAIWS.on('open', () => {
-      log('OpenAI WebSocket connected');
+  // Simple echo test first
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+      log('📨 Received from SignalWire:', message.event);
       
-      // Configure session
-      openAIWS.send(JSON.stringify({
-        type: 'session.update',
-        session: {
-          modalities: ['audio'],
-          instructions: 'You are a live interpreter. Translate English to Spanish and Spanish to English in real-time. Respond only with the translation audio.',
-          voice: 'verse',
-          input_audio_format: 'pcm16',
-          output_audio_format: 'pcm16',
-        },
-      }));
-    });
-    
-    openAIWS.on('message', (data) => {
-      try {
-        const event = JSON.parse(data.toString());
+      if (message.event === 'start') {
+        streamSid = message.start.streamSid;
+        log('🎯 Stream started:', { streamSid });
         
-        if (event.type === 'output_audio_chunk.delta') {
-          // Send translated audio back to SignalWire
-          if (ws.readyState === WebSocket.OPEN && streamSid) {
-            ws.send(JSON.stringify({
-              event: 'media',
-              streamSid: streamSid,
-              media: {
-                payload: event.delta,
-              },
-            }));
-          }
-        }
-      } catch (error) {
-        log('Error processing OpenAI message:', error);
-      }
-    });
-    
-    // Handle SignalWire messages
-    ws.on('message', (data) => {
-      try {
-        const message = JSON.parse(data.toString());
-        log(`Received: ${message.event}`);
+        // Send test audio back immediately
+        const testAudio = Buffer.from('Hello! Translator connected.').toString('base64');
+        ws.send(JSON.stringify({
+          event: 'media',
+          streamSid: streamSid,
+          media: { payload: testAudio }
+        }));
         
-        if (message.event === 'start') {
-          streamSid = message.start.streamSid;
-          log('Stream started', { streamSid });
-        } else if (message.event === 'media' && openAIWS.readyState === WebSocket.OPEN) {
-          // Send audio to OpenAI for translation
-          openAIWS.send(JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: message.media.payload,
+      } else if (message.event === 'media') {
+        log('🎤 Audio received, echoing back');
+        
+        // Echo the audio back
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            event: 'media',
+            streamSid: streamSid,
+            media: { payload: message.media.payload }
           }));
         }
-      } catch (error) {
-        log('Error processing SignalWire message:', error);
       }
-    });
-    
-    ws.on('close', () => {
-      log('SignalWire WebSocket disconnected');
-      if (openAIWS.readyState === WebSocket.OPEN) {
-        openAIWS.close();
-      }
-    });
-    
-  } catch (error) {
-    log('Error setting up translation:', error);
-    ws.close();
-  }
+    } catch (error) {
+      log('❌ Error processing message:', error);
+    }
+  });
+  
+  ws.on('close', () => {
+    log('🔌 SignalWire WebSocket disconnected');
+  });
+  
+  ws.on('error', (error) => {
+    log('❌ WebSocket error:', error);
+  });
 });
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -159,17 +106,12 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Start server
 server.listen(PORT, () => {
   log(`🌍 Phone Translator running on port ${PORT}`);
   log('📞 Ready for calls!');
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-  log('SIGTERM received, shutting down gracefully');
-  server.close(() => {
-    log('Server closed');
-    process.exit(0);
-  });
+  log('🛑 Shutting down gracefully');
+  server.close(() => process.exit(0));
 });

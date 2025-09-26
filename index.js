@@ -31,6 +31,10 @@ app.use(bodyParser.json());
 // Store active OpenAI connections
 const openAIConnections = new Map();
 
+// Audio chunk buffer to prevent flooding OpenAI
+const AUDIO_BUFFER_SIZE = 10; // Buffer up to 10 chunks before sending
+const AUDIO_CHUNK_INTERVAL = 100; // Send buffered audio every 100ms
+
 // Logging function
 function log(message, data = '') {
   const timestamp = new Date().toISOString();
@@ -104,6 +108,8 @@ wss.on('connection', async (ws, req) => {
   let openAIWS = null;
   let sessionId = null;
   let openAIReady = false;
+  let audioBuffer = [];
+  let audioInterval = null;
   
   try {
     // Create OpenAI session
@@ -156,6 +162,16 @@ wss.on('connection', async (ws, req) => {
         } else if (event.type === 'session.updated') {
           log('OpenAI session updated - ready for audio');
           openAIReady = true;
+          
+          // Send audio notification that translator is ready
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              event: 'media',
+              media: {
+                payload: Buffer.from([0x00, 0x00, 0x00, 0x00]).toString('base64'), // Silent audio
+              },
+            }));
+          }
         } else if (event.type === 'output_audio_chunk.delta') {
           // Forward audio chunks to SignalWire
           if (ws.readyState === WebSocket.OPEN) {
@@ -178,6 +194,9 @@ wss.on('connection', async (ws, req) => {
     openAIWS.on('close', () => {
       log('OpenAI WebSocket closed');
       openAIConnections.delete(sessionId);
+      if (audioInterval) {
+        clearInterval(audioInterval);
+      }
       if (ws.readyState === WebSocket.OPEN) {
         ws.close();
       }
@@ -186,6 +205,9 @@ wss.on('connection', async (ws, req) => {
     openAIWS.on('error', (error) => {
       log('OpenAI WebSocket error:', error);
       openAIConnections.delete(sessionId);
+      if (audioInterval) {
+        clearInterval(audioInterval);
+      }
       if (ws.readyState === WebSocket.OPEN) {
         ws.close();
       }
@@ -193,9 +215,29 @@ wss.on('connection', async (ws, req) => {
     
   } catch (error) {
     log('Error setting up OpenAI connection:', error);
+    if (audioInterval) {
+      clearInterval(audioInterval);
+    }
     ws.close();
     return;
   }
+  
+  // Function to send buffered audio to OpenAI
+  function sendBufferedAudio() {
+    if (audioBuffer.length > 0 && openAIReady && openAIWS && openAIWS.readyState === WebSocket.OPEN) {
+      // Combine buffered audio chunks
+      const combinedAudio = audioBuffer.join('');
+      audioBuffer = [];
+      
+      openAIWS.send(JSON.stringify({
+        type: 'input_audio_buffer.append',
+        audio: combinedAudio,
+      }));
+    }
+  }
+  
+  // Start audio buffering interval
+  audioInterval = setInterval(sendBufferedAudio, AUDIO_CHUNK_INTERVAL);
   
   // Handle SignalWire WebSocket messages
   ws.on('message', (data) => {
@@ -206,17 +248,24 @@ wss.on('connection', async (ws, req) => {
       if (message.event === 'start') {
         log('SignalWire stream started', { streamSid: message.start.streamSid });
       } else if (message.event === 'media') {
-        // Forward audio to OpenAI only when ready
-        if (openAIWS && openAIWS.readyState === WebSocket.OPEN && openAIReady) {
-          openAIWS.send(JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: message.media.payload,
-          }));
+        // Buffer audio chunks instead of sending immediately
+        if (openAIReady && openAIWS && openAIWS.readyState === WebSocket.OPEN) {
+          audioBuffer.push(message.media.payload);
+          
+          // Send immediately if buffer is full
+          if (audioBuffer.length >= AUDIO_BUFFER_SIZE) {
+            sendBufferedAudio();
+          }
         } else {
-          log('OpenAI WebSocket not ready for audio - skipping chunk');
+          log('OpenAI not ready - buffering audio chunk');
         }
       } else if (message.event === 'stop') {
         log('SignalWire stream stopped');
+        if (audioInterval) {
+          clearInterval(audioInterval);
+        }
+        // Send any remaining buffered audio
+        sendBufferedAudio();
         if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
           openAIWS.close();
         }
@@ -228,6 +277,9 @@ wss.on('connection', async (ws, req) => {
   
   ws.on('close', () => {
     log('SignalWire WebSocket closed');
+    if (audioInterval) {
+      clearInterval(audioInterval);
+    }
     if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
       openAIWS.close();
     }
@@ -238,6 +290,9 @@ wss.on('connection', async (ws, req) => {
   
   ws.on('error', (error) => {
     log('SignalWire WebSocket error:', error);
+    if (audioInterval) {
+      clearInterval(audioInterval);
+    }
     if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
       openAIWS.close();
     }

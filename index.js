@@ -6,6 +6,10 @@ import twilio from 'twilio';
 import bodyParser from 'body-parser';
 import { createServer } from 'http';
 import { URL } from 'url';
+import dotenv from 'dotenv';
+
+// Load environment variables from .env file
+dotenv.config();
 
 // Load environment variables
 const PORT = process.env.PORT || 3000;

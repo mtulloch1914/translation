@@ -117,11 +117,11 @@ wss.on('connection', async (ws, req) => {
     openAIWS.on('open', () => {
       log('🎯 OpenAI WebSocket connected');
       
-      // Configure translation session
+      // FIXED: Include both audio and text modalities
       const sessionConfig = {
         type: 'session.update',
         session: {
-          modalities: ['audio'],
+          modalities: ['audio', 'text'],  // ✅ FIXED!
           instructions: 'You are a live interpreter. Translate English → Spanish and Spanish → English in real time. Speak naturally and respond with only the translation.',
           voice: 'verse',
           input_audio_format: 'pcm16',
@@ -148,20 +148,9 @@ wss.on('connection', async (ws, req) => {
         log(`📨 OpenAI event: ${event.type}`);
         
         if (event.type === 'session.created') {
-          log('✅ OpenAI session created', { session_id: event.session.id });
+          log('🎯 OpenAI session created', { session_id: event.session.id });
         } else if (event.type === 'session.updated') {
           log('✅ Session updated successfully', { session: event.session });
-          
-          // Send a test message after session is configured
-          setTimeout(() => {
-            if (openAIWS.readyState === WebSocket.OPEN) {
-              log('🧪 Sending test audio buffer commit...');
-              openAIWS.send(JSON.stringify({
-                type: 'input_audio_buffer.commit',
-              }));
-            }
-          }, 1000);
-          
         } else if (event.type === 'conversation.item.created') {
           log('💬 New conversation item created:', event.item);
         } else if (event.type === 'input_audio_buffer.speech_started') {

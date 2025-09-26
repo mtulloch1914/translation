@@ -161,7 +161,7 @@ wss.on('connection', async (ws, req) => {
           openAIReady = true;
           
           // Send audio notification that translator is ready
-          if (ws.readyState === WebSocket.OPEN) {
+          if (ws.readyState === WebSocket.OPEN && streamSid) {
             ws.send(JSON.stringify({
               event: 'media',
               streamSid: streamSid,

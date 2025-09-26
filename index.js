@@ -2,16 +2,15 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
-import twilio from 'twilio';
+import { twiml } from 'twilio';
 import bodyParser from 'body-parser';
 import { createServer } from 'http';
 import { URL } from 'url';
 import dotenv from 'dotenv';
 
-// Load environment variables from .env file
+// Load environment variables
 dotenv.config();
 
-// Load environment variables
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SIGNALWIRE_PROJECT_KEY = process.env.SIGNALWIRE_PROJECT_KEY;
@@ -57,7 +56,8 @@ async function createOpenAISession() {
     });
 
     if (!response.ok) {
-      throw new Error(`OpenAI API error: ${response.status} ${response.statusText}`);
+      const errorText = await response.text();
+      throw new Error(`OpenAI API error: ${response.status} ${response.statusText} - ${errorText}`);
     }
 
     const session = await response.json();
@@ -69,11 +69,11 @@ async function createOpenAISession() {
   }
 }
 
-// POST /voice endpoint - Returns SignalWire LAML to connect to WebSocket
+// POST /voice endpoint - Returns TwiML to connect to WebSocket
 app.post('/voice', (req, res) => {
   log('Received voice request');
   
-  const response = new twilio.twiml.VoiceResponse();
+  const response = new twiml.VoiceResponse();
   
   // Create WebSocket URL for this call
   const protocol = req.headers['x-forwarded-proto'] || 'http';
@@ -105,6 +105,7 @@ wss.on('connection', async (ws, req) => {
   let openAIWS = null;
   let sessionId = null;
   let openAIReady = false;
+  let streamSid = null;
   
   try {
     // Create OpenAI session
@@ -119,7 +120,7 @@ wss.on('connection', async (ws, req) => {
       },
     });
     
-    openAIConnections.set(sessionId, { openAIWS, twilioWS: ws });
+    openAIConnections.set(sessionId, { openAIWS, signalwireWS: ws });
     
     // Handle OpenAI WebSocket connection
     openAIWS.on('open', () => {
@@ -158,36 +159,22 @@ wss.on('connection', async (ws, req) => {
           log('OpenAI session updated - ready for audio');
           openAIReady = true;
           
-          // Send audio notification to agent
+          // Send audio notification that translator is ready
           if (ws.readyState === WebSocket.OPEN) {
-            // Generate a beep tone
-            const beepTone = generateBeepTone();
-            
             ws.send(JSON.stringify({
               event: 'media',
-              streamSid: event.session.id,
+              streamSid: streamSid,
               media: {
-                payload: beepTone,
+                payload: Buffer.from('Translator ready').toString('base64'),
               },
             }));
-            
-            // Send spoken notification
-            setTimeout(() => {
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                  event: 'say',
-                  streamSid: event.session.id,
-                  text: 'Translator ready',
-                }));
-              }
-            }, 500);
           }
         } else if (event.type === 'output_audio_chunk.delta') {
-          // Forward audio chunks to SignalWire
-          if (ws.readyState === WebSocket.OPEN) {
+          // Forward audio chunks to SignalWire only if ready
+          if (openAIReady && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               event: 'media',
-              streamSid: event.stream_sid,
+              streamSid: streamSid,
               media: {
                 payload: event.delta,
               },
@@ -203,7 +190,6 @@ wss.on('connection', async (ws, req) => {
     
     openAIWS.on('close', () => {
       log('OpenAI WebSocket closed');
-      openAIReady = false;
       openAIConnections.delete(sessionId);
       if (ws.readyState === WebSocket.OPEN) {
         ws.close();
@@ -212,7 +198,6 @@ wss.on('connection', async (ws, req) => {
     
     openAIWS.on('error', (error) => {
       log('OpenAI WebSocket error:', error);
-      openAIReady = false;
       openAIConnections.delete(sessionId);
       if (ws.readyState === WebSocket.OPEN) {
         ws.close();
@@ -233,8 +218,9 @@ wss.on('connection', async (ws, req) => {
       
       if (message.event === 'start') {
         log('SignalWire stream started', { streamSid: message.start.streamSid });
+        streamSid = message.start.streamSid;
       } else if (message.event === 'media') {
-        // Only forward audio to OpenAI if ready
+        // Forward audio to OpenAI only if ready
         if (openAIReady && openAIWS && openAIWS.readyState === WebSocket.OPEN) {
           openAIWS.send(JSON.stringify({
             type: 'input_audio_buffer.append',
@@ -256,7 +242,6 @@ wss.on('connection', async (ws, req) => {
   
   ws.on('close', () => {
     log('SignalWire WebSocket closed');
-    openAIReady = false;
     if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
       openAIWS.close();
     }
@@ -267,7 +252,6 @@ wss.on('connection', async (ws, req) => {
   
   ws.on('error', (error) => {
     log('SignalWire WebSocket error:', error);
-    openAIReady = false;
     if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
       openAIWS.close();
     }
@@ -276,25 +260,6 @@ wss.on('connection', async (ws, req) => {
     }
   });
 });
-
-// Helper function to generate a beep tone
-function generateBeepTone(frequency = 800, duration = 0.1, sampleRate = 8000) {
-  const samples = Math.floor(sampleRate * duration);
-  const tone = new Float32Array(samples);
-  
-  for (let i = 0; i < samples; i++) {
-    tone[i] = Math.sin(2 * Math.PI * frequency * i / sampleRate) * 0.3;
-  }
-  
-  // Convert to 16-bit PCM
-  const pcm = new Int16Array(samples);
-  for (let i = 0; i < samples; i++) {
-    pcm[i] = Math.floor(tone[i] * 32767);
-  }
-  
-  // Convert to base64
-  return Buffer.from(pcm.buffer).toString('base64');
-}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -324,7 +289,7 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
-  log('SIGTERM received, shutting down gracefully');
+  log('SIGINT received, shutting down gracefully');
   server.close(() => {
     log('Server closed');
     process.exit(0);

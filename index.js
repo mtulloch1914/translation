@@ -8,9 +8,6 @@ import { createServer } from 'http';
 // Load environment variables
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const SIGNALWIRE_PROJECT_ID = process.env.SIGNALWIRE_PROJECT_ID;
-const SIGNALWIRE_API_TOKEN = process.env.SIGNALWIRE_API_TOKEN;
-const SIGNALWIRE_SPACE_URL = process.env.SIGNALWIRE_SPACE_URL;
 
 // Validate required environment variables
 if (!OPENAI_API_KEY) {
@@ -34,6 +31,7 @@ function log(message, data = '') {
 // Create OpenAI Realtime session
 async function createOpenAISession() {
   try {
+    log('🎯 Creating OpenAI session...');
     const response = await fetch('https://api.openai.com/v1/realtime/sessions', {
       method: 'POST',
       headers: {
@@ -43,19 +41,20 @@ async function createOpenAISession() {
       body: JSON.stringify({
         model: 'gpt-4o-realtime-preview-2024-12-17',
         voice: 'verse',
-        instructions: 'You are a live interpreter. Translate English → Spanish and Spanish → English in real time. Respond only with the translation audio.',
+        instructions: 'You are a live interpreter. Translate English → Spanish and Spanish → English in real time. Speak naturally and respond with only the translation.',
       }),
     });
 
     if (!response.ok) {
-      throw new Error(`OpenAI API error: ${response.status} ${response.statusText}`);
+      const errorText = await response.text();
+      throw new Error(`OpenAI API error: ${response.status} ${response.statusText} - ${errorText}`);
     }
 
     const session = await response.json();
-    log('✅ OpenAI session created successfully');
+    log('✅ OpenAI session created successfully', { session_id: session.id });
     return session;
   } catch (error) {
-    log('❌ Error creating OpenAI session:', error);
+    log('❌ Error creating OpenAI session:', error.message);
     throw error;
   }
 }
@@ -98,6 +97,7 @@ wss.on('connection', async (ws, req) => {
   let streamSid = null;
   let audioChunksReceived = 0;
   let audioChunksSent = 0;
+  let speechStarted = false;
   
   try {
     // Create OpenAI session
@@ -105,6 +105,7 @@ wss.on('connection', async (ws, req) => {
     sessionId = session.id;
     
     // Connect to OpenAI Realtime API
+    log('🔗 Connecting to OpenAI WebSocket...');
     openAIWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', {
       headers: {
         'Authorization': `Bearer ${OPENAI_API_KEY}`,
@@ -117,11 +118,11 @@ wss.on('connection', async (ws, req) => {
       log('🎯 OpenAI WebSocket connected');
       
       // Configure translation session
-      openAIWS.send(JSON.stringify({
+      const sessionConfig = {
         type: 'session.update',
         session: {
           modalities: ['audio'],
-          instructions: 'You are a live interpreter. Translate English → Spanish and Spanish → English in real time. Respond only with the translation audio.',
+          instructions: 'You are a live interpreter. Translate English → Spanish and Spanish → English in real time. Speak naturally and respond with only the translation.',
           voice: 'verse',
           input_audio_format: 'pcm16',
           output_audio_format: 'pcm16',
@@ -135,16 +136,63 @@ wss.on('connection', async (ws, req) => {
             silence_duration_ms: 200,
           },
         },
-      }));
-      log('🎯 Translation session configured');
+      };
+      
+      log('📤 Sending session config to OpenAI...');
+      openAIWS.send(JSON.stringify(sessionConfig));
     });
     
     openAIWS.on('message', (data) => {
       try {
         const event = JSON.parse(data.toString());
+        log(`📨 OpenAI event: ${event.type}`);
         
         if (event.type === 'session.created') {
-          log('🎯 OpenAI session active', { session_id: event.session.id });
+          log('✅ OpenAI session created', { session_id: event.session.id });
+        } else if (event.type === 'session.updated') {
+          log('✅ Session updated successfully', { session: event.session });
+          
+          // Send a test message after session is configured
+          setTimeout(() => {
+            if (openAIWS.readyState === WebSocket.OPEN) {
+              log('🧪 Sending test audio buffer commit...');
+              openAIWS.send(JSON.stringify({
+                type: 'input_audio_buffer.commit',
+              }));
+            }
+          }, 1000);
+          
+        } else if (event.type === 'conversation.item.created') {
+          log('💬 New conversation item created:', event.item);
+        } else if (event.type === 'input_audio_buffer.speech_started') {
+          speechStarted = true;
+          log('🎤 Speech detected in input audio');
+        } else if (event.type === 'input_audio_buffer.speech_stopped') {
+          speechStarted = false;
+          log('🔇 Speech ended in input audio');
+          
+          // Commit the audio buffer when speech stops
+          if (openAIWS.readyState === WebSocket.OPEN) {
+            log('📤 Committing audio buffer after speech...');
+            openAIWS.send(JSON.stringify({
+              type: 'input_audio_buffer.commit',
+            }));
+            
+            // Generate response
+            setTimeout(() => {
+              if (openAIWS.readyState === WebSocket.OPEN) {
+                log('📤 Requesting response generation...');
+                openAIWS.send(JSON.stringify({
+                  type: 'response.create',
+                }));
+              }
+            }, 100);
+          }
+          
+        } else if (event.type === 'response.audio_transcript.delta') {
+          log('📝 Translation text:', event.delta);
+        } else if (event.type === 'response.audio.delta') {
+          log('🔊 Response audio delta received');
         } else if (event.type === 'output_audio_chunk.delta') {
           audioChunksSent++;
           log(`🔊 Translation audio chunk #${audioChunksSent} received from OpenAI`);
@@ -160,12 +208,15 @@ wss.on('connection', async (ws, req) => {
             }));
             log(`📤 Translation audio chunk #${audioChunksSent} sent to caller`);
           }
+        } else if (event.type === 'response.done') {
+          log('✅ Response completed', { 
+            response_id: event.response.id,
+            status: event.response.status 
+          });
         } else if (event.type === 'error') {
           log('❌ OpenAI error:', event);
-        } else if (event.type === 'input_audio_buffer.speech_started') {
-          log('🎤 Speech detected in input audio');
-        } else if (event.type === 'input_audio_buffer.speech_stopped') {
-          log('🔇 Speech ended in input audio');
+        } else if (event.type === 'conversation.item.completed') {
+          log('💬 Conversation item completed:', event.item);
         }
       } catch (error) {
         log('❌ Error processing OpenAI message:', error);
@@ -196,7 +247,11 @@ wss.on('connection', async (ws, req) => {
         log('🎤 SignalWire stream started', { streamSid: streamSid });
       } else if (message.event === 'media') {
         audioChunksReceived++;
-        log(`🎤 Audio chunk #${audioChunksReceived} received from caller`);
+        
+        // Only log every 100th chunk to avoid spam
+        if (audioChunksReceived % 100 === 0) {
+          log(`🎤 Audio chunk #${audioChunksReceived} received from caller`);
+        }
         
         // Forward audio to OpenAI for translation
         if (openAIWS && openAIWS.readyState === WebSocket.OPEN) {
@@ -204,7 +259,10 @@ wss.on('connection', async (ws, req) => {
             type: 'input_audio_buffer.append',
             audio: message.media.payload,
           }));
-          log(`📤 Audio chunk #${audioChunksReceived} forwarded to OpenAI`);
+          
+          if (audioChunksReceived % 100 === 0) {
+            log(`📤 Audio chunk #${audioChunksReceived} forwarded to OpenAI`);
+          }
         } else {
           log('❌ OpenAI WebSocket not ready for audio');
         }

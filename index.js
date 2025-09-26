@@ -2,7 +2,6 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
-import { twiml } from 'twilio';
 import bodyParser from 'body-parser';
 import { createServer } from 'http';
 import { URL } from 'url';
@@ -69,11 +68,9 @@ async function createOpenAISession() {
   }
 }
 
-// POST /voice endpoint - Returns TwiML to connect to WebSocket
+// POST /voice endpoint - Returns SignalWire compatible response
 app.post('/voice', (req, res) => {
   log('Received voice request');
-  
-  const response = new twiml.VoiceResponse();
   
   // Create WebSocket URL for this call
   const protocol = req.headers['x-forwarded-proto'] || 'http';
@@ -82,12 +79,16 @@ app.post('/voice', (req, res) => {
   
   log(`Connecting to WebSocket: ${wsUrl}`);
   
-  // Connect to WebSocket media stream
-  const connect = response.connect();
-  connect.stream({ url: wsUrl });
+  // Return SignalWire compatible XML response
+  const xmlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}" />
+  </Connect>
+</Response>`;
   
   res.type('text/xml');
-  res.send(response.toString());
+  res.send(xmlResponse);
 });
 
 // WebSocket endpoint for SignalWire Media Stream
